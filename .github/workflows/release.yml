@@ -1,10 +1,11 @@
 name: goreleaser
 
+# Auto-trigger disabled: release-binaries.yml owns 'v*' tags and publishes the
+# curl-able raw Linux binaries. Running goreleaser on the same tag would race it
+# (goreleaser `release --clean` creates/cleans the same Release). Re-enable by
+# restoring the `push: tags: ['v*']` trigger below.
 on:
-  push:
-    # run only against tags
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write

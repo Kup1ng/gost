@@ -3,12 +3,12 @@
 
 name: docker
 
-on: 
-  push:
-    branches:
-    - master
-    tags:
-    - 'v*'
+# Auto-trigger disabled: this pushes to DockerHub using DOCKER_* secrets that are
+# unset on this fork (so it failed on every push), and it would also race
+# release-binaries.yml on 'v*' tags. Re-enable by restoring the push trigger and
+# setting the DOCKER_IMAGE/DOCKER_USERNAME/DOCKER_PASSWORD secrets.
+on:
+  workflow_dispatch:
 
 jobs:
   build:
