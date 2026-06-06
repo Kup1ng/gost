@@ -191,10 +191,14 @@ catch-all rule), so SSH and other traffic are never captured, and multiple `--NA
 run on one host without colliding.
 
 **Kernel tuning (global, raise-only).** In NAT mode gost raises — and never lowers —
-`net.ipv4.ip_forward=1` (needed to forward to another host), `nf_conntrack_max` (floor 262144,
-clamped to ~10% of RAM; override with `--nat-conntrack-max N`), and the conntrack hash size. These
-are host-wide and persist until reboot (lowering them could break live connections or a sibling
-service). conntrack timeouts are left alone unless you pass `--nat-tune-timeouts`.
+`net.ipv4.ip_forward=1` (needed to forward to another host), `nf_conntrack_max` (to **1048576 / ~1M**
+by default — well above Ubuntu's 262144 — clamped down to ~10% of RAM on small boxes; override with
+`--nat-conntrack-max N`), and the conntrack hash size (`hashsize`, to ~max/4). It loads the
+`nf_conntrack` module first if needed, logs each value it sets (with a read-back), and logs when a
+value is already high enough to leave alone. These are host-wide runtime settings that persist until
+reboot and are re-applied on every gost start (gost never writes `/etc/sysctl.d`, and never lowers a
+value — that could break live connections or a sibling service). conntrack timeouts are left alone
+unless you pass `--nat-tune-timeouts`.
 
 **Install gost as a system command** (so `--nat-cleanup` and the systemd unit use the same binary):
 

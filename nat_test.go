@@ -129,6 +129,36 @@ func TestResolveNATDest(t *testing.T) {
 	}
 }
 
+func TestConntrackTarget(t *testing.T) {
+	const ubuntuDefault = 262144
+	tests := []struct {
+		name                    string
+		current, optMax, memCap int
+		want                    int
+	}{
+		// The original bug: default floor == Ubuntu default meant no raise.
+		// With the floor at 1M, a typical box raises well above the default.
+		{"raise above default (4GB box)", ubuntuDefault, 0, 1109000, defaultConntrackFloor},
+		{"no memcap info -> full floor", ubuntuDefault, 0, 0, defaultConntrackFloor},
+		{"default clamped to memcap", ubuntuDefault, 0, 300000, 300000},
+		{"memcap below current -> raise-only keeps current", ubuntuDefault, 0, 145000, ubuntuDefault},
+		{"explicit override honored, not clamped", ubuntuDefault, 2000000, 1109000, 2000000},
+		{"already high -> raise-only leaves it", 2000000, 0, 1109000, 2000000},
+		{"explicit below current -> raise-only keeps current", 500000, 300000, 0, 500000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := conntrackTarget(tt.current, tt.optMax, tt.memCap); got != tt.want {
+				t.Errorf("conntrackTarget(%d,%d,%d) = %d, want %d",
+					tt.current, tt.optMax, tt.memCap, got, tt.want)
+			}
+		})
+	}
+	if defaultConntrackFloor <= 262144 {
+		t.Errorf("defaultConntrackFloor=%d must be above the Ubuntu default 262144, else raise-only never fires", defaultConntrackFloor)
+	}
+}
+
 func TestIsProtectedSSHPort(t *testing.T) {
 	if blocked, _ := IsProtectedSSHPort(22); !blocked {
 		t.Error("port 22 should be protected")

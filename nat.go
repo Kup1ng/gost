@@ -90,6 +90,41 @@ func instanceHash(forwards []NATForward) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
+const (
+	// defaultConntrackFloor is the nf_conntrack_max we raise to in NAT mode when
+	// no --nat-conntrack-max is given: ~1M entries (~360 MB at ~360 bytes/entry),
+	// suitable for hundreds of thousands of concurrent connections with headroom.
+	// It is deliberately well above Ubuntu's 262144 default. On smaller boxes it
+	// is clamped down to ~10% of RAM (see memoryConntrackCap); it is never raised
+	// below the current value (raise-only).
+	defaultConntrackFloor = 1048576
+	// bytesPerConntrackEntry is the rough kernel memory cost per conntrack entry,
+	// used to clamp the table so we never plan to use more than ~10% of RAM.
+	bytesPerConntrackEntry = 360
+)
+
+// conntrackTarget computes the raise-only nf_conntrack_max target.
+//   - current: the value currently in the kernel.
+//   - optMax:  --nat-conntrack-max (0 means "use the built-in floor").
+//   - memCap:  memory-derived ceiling, or 0 if unknown / no clamp.
+//
+// An explicit optMax is honored as-is (not memory-clamped — the operator opted
+// in). The default floor is clamped to memCap. The result is never below
+// current (raise-only, so we never shrink the table out from under live
+// traffic, including the SSH session itself).
+func conntrackTarget(current, optMax, memCap int) int {
+	desired := defaultConntrackFloor
+	if optMax > 0 {
+		desired = optMax
+	} else if memCap > 0 && desired > memCap {
+		desired = memCap
+	}
+	if desired < current {
+		desired = current
+	}
+	return desired
+}
+
 // ParseNATForward parses a single -L serve-node string into a NATForward,
 // enforcing NAT-mode constraints: tcp/udp only, exactly one destination, and
 // literal-or-resolved IPv4 addresses. The SSH-port guard is applied separately
