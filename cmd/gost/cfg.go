@@ -22,6 +22,9 @@ type baseConfig struct {
 	route
 	Routes []route
 	Debug  bool
+	// NAT enables kernel (in-kernel DNAT) forwarding mode for all -L rules.
+	// Opt-in only; never auto-enabled.
+	NAT bool
 }
 
 func parseBaseConfig(s string) (*baseConfig, error) {

@@ -21,6 +21,7 @@ Features
 * [Tunnel UDP over TCP](https://v2.gost.run/en/socks/)
 * [TCP/UDP Transparent proxy](https://v2.gost.run/en/redirect/)
 * [Local/remote TCP/UDP port forwarding](https://v2.gost.run/en/port-forwarding/)
+* Kernel NAT forwarding mode (`--NAT`, in-kernel DNAT — see below)
 * [Shadowsocks protocol](https://v2.gost.run/en/ss/)
 * [SNI proxy](https://v2.gost.run/en/sni/)
 * [Permission control](https://v2.gost.run/en/permission/)
@@ -158,6 +159,118 @@ The data on the local UDP port 5353 is forwarded to 192.168.1.1:53 (through the 
 Each forwarding channel has a timeout period. When this time is exceeded and there is no data interaction during this time period, the channel will be closed. The timeout value can be set by the `ttl` parameter. The default value is 60 seconds.
 
 **NOTE:** When forwarding UDP data, if there is a proxy chain, the end of the chain (the last -F parameter) must be gost SOCKS5 proxy, gost will use UDP-over-TCP to forward data.
+
+#### Kernel NAT forwarding mode (`--NAT`)
+
+> Linux only. Requires root (or `CAP_NET_ADMIN`). Opt-in; never auto-enabled.
+
+By default gost forwards `-L` traffic in **userspace** (it accepts the connection, dials the
+destination, and copies the bytes). The `--NAT` flag instead programs each forward as an
+**in-kernel DNAT rule** (netfilter + conntrack). After the first packet, all traffic is translated
+and forwarded entirely in the kernel — gost is never in the data path — giving near-zero
+per-connection CPU/memory and much higher throughput.
+
+```bash
+sudo gost --NAT -L=tcp://:8080/1.2.3.4:80 -L=udp://:5353/1.2.3.4:53
+```
+
+`--NAT` applies to **every** `-L` rule in the process. When `--NAT` is absent, everything behaves
+exactly like stock gost.
+
+**Constraints**
+
+* TCP and UDP only; IPv4 only. Each `-L` must be an explicit `tcp://` or `udp://` forward to exactly **one** `DESTIP:DESTPORT` (a hostname is resolved once at startup and pinned).
+* `--NAT` is **incompatible with `-F`** (SOCKS5 chaining); combining them fails at startup. Chaining only works in userspace mode.
+* Requires root / `CAP_NET_ADMIN` and a working `nft` or `iptables` (see install below).
+
+**Backends.** gost prefers **nftables** (its own table `gost_nat_<id>`) and falls back to
+**iptables** (its own `GOST_*` chains). Force one with `--nat-backend=nftables|iptables` (default
+`auto`). If neither tool is usable, gost refuses to start — it will **not** silently fall back to
+userspace forwarding. Every rule is scoped exactly to its `-L` port/target (never a broad or
+catch-all rule), so SSH and other traffic are never captured, and multiple `--NAT` services can
+run on one host without colliding.
+
+**Kernel tuning (global, raise-only).** In NAT mode gost raises — and never lowers —
+`net.ipv4.ip_forward=1` (needed to forward to another host), `nf_conntrack_max` (floor 262144,
+clamped to ~10% of RAM; override with `--nat-conntrack-max N`), and the conntrack hash size. These
+are host-wide and persist until reboot (lowering them could break live connections or a sibling
+service). conntrack timeouts are left alone unless you pass `--nat-tune-timeouts`.
+
+**Install gost as a system command** (so `--nat-cleanup` and the systemd unit use the same binary):
+
+```bash
+cd gost/cmd/gost && go build
+sudo install -m 0755 gost /usr/local/bin/gost
+```
+
+**Install a netfilter tool** (whichever your host is missing — gost only needs one):
+
+```bash
+sudo apt update && sudo apt install -y nftables   # preferred
+# or
+sudo apt update && sudo apt install -y iptables
+```
+
+Inspect the rules gost created:
+
+```bash
+sudo nft list ruleset | grep -A 20 gost_nat      # nftables backend
+sudo iptables -t nat -S | grep GOST              # iptables backend
+```
+
+**Cleanup & safety.** gost removes its own rules (and flushes the matching conntrack entries) on
+normal stop and on `SIGINT`/`SIGTERM` (Ctrl-C, `systemctl stop`). To cover crashes:
+
+* On startup gost first clears any stale rules left by a previous crashed run of the **same** forward set (programming is an idempotent replace).
+* Runtime rules are never persisted, so a reboot clears them.
+* The rescue command removes **all** gost-created NAT rules if anything is ever stranded:
+
+  ```bash
+  sudo gost --nat-cleanup
+  ```
+
+  Scoped to specific forwards (used by the systemd unit below):
+
+  ```bash
+  sudo gost --nat-cleanup -L=tcp://:8080/1.2.3.4:80
+  ```
+
+**systemd** (recommended for production). `ExecStopPost` is a second cleanup layer that runs even
+after a crash. The `-L` value contains `:` and `/`, so carry it via a per-instance
+`EnvironmentFile`:
+
+```ini
+# /etc/systemd/system/gost-nat@.service
+[Unit]
+Description=gost NAT forward %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gost-nat/%i.env          # contains e.g.: GOST_L=tcp://:8080/1.2.3.4:80
+ExecStart=/usr/local/bin/gost --NAT -L=${GOST_L}
+ExecStopPost=/usr/local/bin/gost --nat-cleanup -L=${GOST_L}
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo mkdir -p /etc/gost-nat
+echo 'GOST_L=tcp://:8080/1.2.3.4:80' | sudo tee /etc/gost-nat/web.env
+sudo systemctl enable --now gost-nat@web
+```
+
+**Limitations.** Single destination per `-L` (no kernel load-balancing); a hostname destination is
+resolved once (restart to follow DNS changes); the destination sees the gost host's IP, not the
+original client (MASQUERADE — disable with `--nat-no-snat` only when gost is on the return path);
+on a host with a restrictive firewall in another table you may still need to allow the port there
+(gost adds a scoped FORWARD accept by default — disable with `--nat-no-forward-rule`); forwarding
+the SSH port is refused unless you pass `--nat-allow-ssh-port`.
 
 #### Remote TCP port forwarding
 

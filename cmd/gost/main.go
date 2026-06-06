@@ -39,6 +39,17 @@ func init() {
 	if pprofEnabled {
 		flag.StringVar(&pprofAddr, "P", ":6060", "profiling HTTP server address")
 	}
+
+	// Kernel NAT forwarding mode (opt-in; Linux only). See README "NAT mode".
+	flag.BoolVar(&baseCfg.NAT, "NAT", false, "enable kernel NAT (in-kernel DNAT) forwarding for all -L rules (Linux, root; incompatible with -F)")
+	flag.BoolVar(&natCleanup, "nat-cleanup", false, "remove gost NAT rules and exit (scoped to -L if given, otherwise ALL gost rules)")
+	flag.StringVar(&natBackend, "nat-backend", "auto", "NAT backend: auto|nftables|iptables")
+	flag.IntVar(&natConntrackMax, "nat-conntrack-max", 0, "NAT mode: raise nf_conntrack_max to at least this value (0 = built-in floor)")
+	flag.BoolVar(&natNoSNAT, "nat-no-snat", false, "NAT mode: do not add the scoped MASQUERADE rule (gateway/same-path topologies)")
+	flag.BoolVar(&natNoForward, "nat-no-forward-rule", false, "NAT mode: do not add the scoped FORWARD accept rule")
+	flag.BoolVar(&natAllowSSH, "nat-allow-ssh-port", false, "NAT mode: allow a -L listen port equal to the SSH port (dangerous)")
+	flag.BoolVar(&natTuneTO, "nat-tune-timeouts", false, "NAT mode: also lower conntrack time_wait/fin_wait timeouts")
+
 	flag.Parse()
 
 	if printVersion {
@@ -61,6 +72,17 @@ func init() {
 }
 
 func main() {
+	// NAT-mode branches manage their own lifecycle and run cleanup via signal
+	// handlers / deferred stop, so they must NOT go through the userspace path
+	// (which blocks forever on select{}). Handled here in main(), not init(),
+	// because init() uses os.Exit which would skip deferred cleanup.
+	if natCleanup {
+		os.Exit(runNATCleanup())
+	}
+	if baseCfg.NAT {
+		os.Exit(runNAT())
+	}
+
 	if pprofEnabled {
 		go func() {
 			log.Log("profiling server on", pprofAddr)
