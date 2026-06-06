@@ -129,8 +129,12 @@ func (b *nftBackend) ruleset(table string, forwards []NATForward, opts NATOption
 	sb.WriteString("\t}\n")
 
 	// forward ACCEPT, scoped to the DNAT'd flow (+ established/related replies).
+	// NOTE: the chain is named "forward" (not "fwd") because `fwd` is a reserved
+	// nftables keyword (the fwd verdict statement) and is rejected as a chain
+	// name; "forward" is a valid identifier (it is the chain name in Ubuntu's
+	// default /etc/nftables.conf).
 	if !opts.NoForwardRule {
-		sb.WriteString("\tchain fwd {\n")
+		sb.WriteString("\tchain forward {\n")
 		sb.WriteString("\t\ttype filter hook forward priority 0; policy accept;\n")
 		for _, f := range forwards {
 			// accept both directions of this DNAT'd flow only.

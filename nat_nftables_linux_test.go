@@ -17,8 +17,15 @@ func TestNftRuleset(t *testing.T) {
 	table := b.tableName(forwards)
 	doc := b.ruleset(table, forwards, NATOptions{})
 
+	// `fwd` is a reserved nftables keyword and is rejected as a chain name; the
+	// forward chain must be named "forward".
+	if strings.Contains(doc, "chain fwd ") || strings.Contains(doc, "chain fwd{") {
+		t.Errorf("ruleset uses reserved keyword `fwd` as a chain name:\n%s", doc)
+	}
+
 	mustContain := []string{
 		"table ip " + table + " {",
+		"chain forward {",
 		"type nat hook prerouting priority -100",
 		"type nat hook postrouting priority 100",
 		"type filter hook forward priority 0",
