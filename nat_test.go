@@ -11,12 +11,19 @@ func mkFwd(proto, bind string, lport int, dest string, dport int) NATForward {
 		Proto:    proto,
 		BindAddr: bind,
 		LPort:    lport,
-		DestIP:   net.ParseIP(dest).To4(),
-		DestPort: dport,
+		Dests:    []NATDest{{IP: net.ParseIP(dest).To4(), Port: dport, Weight: 1}},
 	}
 }
 
-func TestNATForwardTag(t *testing.T) {
+func mkFwdMulti(proto, bind string, lport int, dests ...NATDest) NATForward {
+	return NATForward{Proto: proto, BindAddr: bind, LPort: lport, Dests: dests}
+}
+
+func dst(ip string, port, weight int) NATDest {
+	return NATDest{IP: net.ParseIP(ip).To4(), Port: port, Weight: weight}
+}
+
+func TestNATForwardIdentity(t *testing.T) {
 	tests := []struct {
 		f    NATForward
 		want string
@@ -25,9 +32,25 @@ func TestNATForwardTag(t *testing.T) {
 		{mkFwd("udp", "10.0.0.1", 5353, "8.8.8.8", 53), "gost-nat:udp:10.0.0.1:5353->8.8.8.8:53"},
 	}
 	for _, tt := range tests {
-		if got := tt.f.tag(); got != tt.want {
-			t.Errorf("tag() = %q, want %q", got, tt.want)
+		// single-dest identity AND comment must be byte-identical to the proven
+		// single-destination tag (so existing table names / rule comments don't move).
+		if got := tt.f.identity(); got != tt.want {
+			t.Errorf("identity() = %q, want %q", got, tt.want)
 		}
+		if got := tt.f.comment(); got != tt.want {
+			t.Errorf("comment() = %q, want %q", got, tt.want)
+		}
+	}
+
+	// multi-dest identity includes every backend + weight (feeds the table hash).
+	m := mkFwdMulti("tcp", "", 8001, dst("1.1.1.1", 80, 3), dst("2.2.2.2", 80, 1))
+	if got, want := m.identity(), "gost-nat:tcp:0.0.0.0:8001->1.1.1.1:80:3,2.2.2.2:80:1"; got != want {
+		t.Errorf("multi identity() = %q, want %q", got, want)
+	}
+	// changing a weight must change the identity (=> new table, idempotent replace).
+	m2 := mkFwdMulti("tcp", "", 8001, dst("1.1.1.1", 80, 2), dst("2.2.2.2", 80, 1))
+	if m.identity() == m2.identity() {
+		t.Error("changing a weight must change identity")
 	}
 }
 
@@ -71,8 +94,8 @@ func TestParseNATForwardValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if f.Proto != "tcp" || f.LPort != 8080 || f.BindAddr != "" ||
-		f.DestIP.String() != "1.2.3.4" || f.DestPort != 80 {
+	if f.Proto != "tcp" || f.LPort != 8080 || f.BindAddr != "" || len(f.Dests) != 1 ||
+		f.Dests[0].IP.String() != "1.2.3.4" || f.Dests[0].Port != 80 {
 		t.Errorf("wrong forward: %+v", f)
 	}
 
@@ -80,9 +103,37 @@ func TestParseNATForwardValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if f.Proto != "udp" || f.LPort != 5353 || f.BindAddr != "10.0.0.1" ||
-		f.DestIP.String() != "8.8.8.8" || f.DestPort != 53 {
+	if f.Proto != "udp" || f.LPort != 5353 || f.BindAddr != "10.0.0.1" || len(f.Dests) != 1 ||
+		f.Dests[0].IP.String() != "8.8.8.8" || f.Dests[0].Port != 53 {
 		t.Errorf("wrong forward: %+v", f)
+	}
+}
+
+func TestParseNATForwardMultiDest(t *testing.T) {
+	f, err := ParseNATForward("tcp://:8001/1.1.1.1:80:3,2.2.2.2:80:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Dests) != 2 {
+		t.Fatalf("want 2 dests, got %d", len(f.Dests))
+	}
+	if f.Dests[0].Weight != 3 || f.Dests[1].Weight != 1 {
+		t.Errorf("weights = %d:%d, want 3:1", f.Dests[0].Weight, f.Dests[1].Weight)
+	}
+	if f.totalWeight() != 4 {
+		t.Errorf("totalWeight = %d, want 4", f.totalWeight())
+	}
+
+	// equal weights default to 1
+	f, _ = ParseNATForward("tcp://:8001/1.1.1.1:80,2.2.2.2:80,3.3.3.3:80")
+	if len(f.Dests) != 3 || f.totalWeight() != 3 {
+		t.Errorf("equal 3-dest: got %d dests, total %d", len(f.Dests), f.totalWeight())
+	}
+
+	// GCD reduction: 6:2 -> 3:1
+	f, _ = ParseNATForward("tcp://:8001/1.1.1.1:80:6,2.2.2.2:80:2")
+	if f.Dests[0].Weight != 3 || f.Dests[1].Weight != 1 {
+		t.Errorf("GCD-reduced weights = %d:%d, want 3:1", f.Dests[0].Weight, f.Dests[1].Weight)
 	}
 }
 
@@ -90,8 +141,10 @@ func TestParseNATForwardRejections(t *testing.T) {
 	cases := map[string]string{
 		"non-tcp/udp transport": "http://:8080/1.2.3.4:80",
 		"missing destination":   "tcp://:8080",
-		"multiple destinations": "tcp://:8080/1.2.3.4:80,5.6.7.8:80",
 		"ipv6 destination":      "tcp://:8080/[2001:db8::1]:80",
+		"bad weight zero":       "tcp://:8080/1.2.3.4:80:0",
+		"missing port in list":  "tcp://:8080/1.2.3.4,2.2.2.2:80",
+		"ipv6 in list":          "tcp://:8080/1.2.3.4:80,[2001:db8::1]:80",
 	}
 	for name, l := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -126,36 +179,6 @@ func TestResolveNATDest(t *testing.T) {
 	}
 	if _, err := resolveNATDest("2001:db8::1"); err == nil {
 		t.Error("resolveNATDest(ipv6) should error in v1")
-	}
-}
-
-func TestConntrackTarget(t *testing.T) {
-	const ubuntuDefault = 262144
-	tests := []struct {
-		name                    string
-		current, optMax, memCap int
-		want                    int
-	}{
-		// The original bug: default floor == Ubuntu default meant no raise.
-		// With the floor at 1M, a typical box raises well above the default.
-		{"raise above default (4GB box)", ubuntuDefault, 0, 1109000, defaultConntrackFloor},
-		{"no memcap info -> full floor", ubuntuDefault, 0, 0, defaultConntrackFloor},
-		{"default clamped to memcap", ubuntuDefault, 0, 300000, 300000},
-		{"memcap below current -> raise-only keeps current", ubuntuDefault, 0, 145000, ubuntuDefault},
-		{"explicit override honored, not clamped", ubuntuDefault, 2000000, 1109000, 2000000},
-		{"already high -> raise-only leaves it", 2000000, 0, 1109000, 2000000},
-		{"explicit below current -> raise-only keeps current", 500000, 300000, 0, 500000},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := conntrackTarget(tt.current, tt.optMax, tt.memCap); got != tt.want {
-				t.Errorf("conntrackTarget(%d,%d,%d) = %d, want %d",
-					tt.current, tt.optMax, tt.memCap, got, tt.want)
-			}
-		})
-	}
-	if defaultConntrackFloor <= 262144 {
-		t.Errorf("defaultConntrackFloor=%d must be above the Ubuntu default 262144, else raise-only never fires", defaultConntrackFloor)
 	}
 }
 

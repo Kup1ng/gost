@@ -73,46 +73,64 @@ func (b *iptablesBackend) program(forwards []NATForward, opts NATOptions) error 
 	}
 
 	for _, f := range forwards {
-		tag := f.tag()
+		tag := f.comment()
 		dport := strconv.Itoa(f.LPort)
-		ddest := f.DestIP.String()
-		ddport := strconv.Itoa(f.DestPort)
 
-		// DNAT: scoped exactly to the -L port (+ bind addr if non-wildcard).
-		dnat := []string{"-p", f.Proto}
-		if !f.Wildcard() {
-			dnat = append(dnat, "-d", f.BindAddr)
-		}
-		dnat = append(dnat, "--dport", dport,
-			"-m", "comment", "--comment", tag,
-			"-j", "DNAT", "--to-destination", f.dest())
-		if err := b.ipt.Append("nat", pre, dnat...); err != nil {
-			return fmt.Errorf("DNAT %s: %w", tag, err)
-		}
-
-		// MASQUERADE: only for this DNAT'd flow.
-		if !opts.NoSNAT {
-			masq := []string{"-p", f.Proto, "-d", ddest, "--dport", ddport,
-				"-m", "conntrack", "--ctstate", "DNAT",
-				"-m", "comment", "--comment", tag, "-j", "MASQUERADE"}
-			if err := b.ipt.Append("nat", post, masq...); err != nil {
-				return fmt.Errorf("MASQUERADE %s: %w", tag, err)
+		// DNAT. A single destination is a plain DNAT. Multiple destinations are
+		// weighted-RANDOM via the statistic module with CUMULATIVE conditional
+		// probabilities (iptables has no strict weighted-nth mode; strict
+		// weighted round-robin is the nftables `numgen inc` path). For each
+		// backend except the last, probability = weight / (sum of remaining
+		// weights); the last backend is the no-statistic catch-all and MUST be
+		// appended last. Distribution is per-connection: PREROUTING DNAT is only
+		// applied to the first/NEW packet of a flow (conntrack), so statistic
+		// rolls once per connection and the flow then sticks to that backend.
+		remaining := f.totalWeight()
+		for i, d := range f.Dests {
+			dnat := []string{"-p", f.Proto}
+			if !f.Wildcard() {
+				dnat = append(dnat, "-d", f.BindAddr)
 			}
+			dnat = append(dnat, "--dport", dport)
+			if i < len(f.Dests)-1 {
+				p := float64(d.Weight) / float64(remaining)
+				dnat = append(dnat, "-m", "statistic", "--mode", "random",
+					"--probability", strconv.FormatFloat(p, 'f', 6, 64))
+			}
+			dnat = append(dnat, "-m", "comment", "--comment", tag,
+				"-j", "DNAT", "--to-destination", d.hostport())
+			if err := b.ipt.Append("nat", pre, dnat...); err != nil {
+				return fmt.Errorf("DNAT %s: %w", tag, err)
+			}
+			remaining -= d.Weight
 		}
 
-		// FORWARD accept, both directions of this DNAT'd flow only.
-		if !opts.NoForwardRule {
-			out := []string{"-p", f.Proto, "-d", ddest, "--dport", ddport,
-				"-m", "conntrack", "--ctstate", "DNAT",
-				"-m", "comment", "--comment", tag, "-j", "ACCEPT"}
-			ret := []string{"-p", f.Proto, "-s", ddest, "--sport", ddport,
-				"-m", "conntrack", "--ctstate", "DNAT",
-				"-m", "comment", "--comment", tag, "-j", "ACCEPT"}
-			if err := b.ipt.Append("filter", fwd, out...); err != nil {
-				return fmt.Errorf("FORWARD accept %s: %w", tag, err)
+		// MASQUERADE + FORWARD accept: one (resp. two) rule(s) per backend,
+		// each scoped to flows this table DNAT'd.
+		for _, d := range f.Dests {
+			ddest := d.IP.String()
+			ddport := strconv.Itoa(d.Port)
+			if !opts.NoSNAT {
+				masq := []string{"-p", f.Proto, "-d", ddest, "--dport", ddport,
+					"-m", "conntrack", "--ctstate", "DNAT",
+					"-m", "comment", "--comment", tag, "-j", "MASQUERADE"}
+				if err := b.ipt.Append("nat", post, masq...); err != nil {
+					return fmt.Errorf("MASQUERADE %s: %w", tag, err)
+				}
 			}
-			if err := b.ipt.Append("filter", fwd, ret...); err != nil {
-				return fmt.Errorf("FORWARD return %s: %w", tag, err)
+			if !opts.NoForwardRule {
+				out := []string{"-p", f.Proto, "-d", ddest, "--dport", ddport,
+					"-m", "conntrack", "--ctstate", "DNAT",
+					"-m", "comment", "--comment", tag, "-j", "ACCEPT"}
+				ret := []string{"-p", f.Proto, "-s", ddest, "--sport", ddport,
+					"-m", "conntrack", "--ctstate", "DNAT",
+					"-m", "comment", "--comment", tag, "-j", "ACCEPT"}
+				if err := b.ipt.Append("filter", fwd, out...); err != nil {
+					return fmt.Errorf("FORWARD accept %s: %w", tag, err)
+				}
+				if err := b.ipt.Append("filter", fwd, ret...); err != nil {
+					return fmt.Errorf("FORWARD return %s: %w", tag, err)
+				}
 			}
 		}
 	}

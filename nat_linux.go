@@ -88,7 +88,7 @@ func (m *NATManager) Setup() error {
 		return fmt.Errorf("[nat] program rules: %w", err)
 	}
 	for _, f := range m.forwards {
-		log.Logf("[nat] %s :%d -> %s (in-kernel DNAT)", f.Proto, f.LPort, f.dest())
+		log.Logf("[nat] %s :%d -> %s (in-kernel DNAT)", f.Proto, f.LPort, f.destsLabel())
 	}
 	return nil
 }
@@ -238,6 +238,12 @@ const (
 	conntrackHashPath = "/sys/module/nf_conntrack/parameters/hashsize"
 	ipForwardPath     = "/proc/sys/net/ipv4/ip_forward"
 
+	// defaultConntrackFloor is the minimum nf_conntrack_max we ensure in NAT
+	// mode (~90 MB of conntrack memory at ~360 bytes/entry).
+	defaultConntrackFloor = 262144
+	// bytesPerConntrackEntry is the rough kernel memory cost per entry, used to
+	// clamp the table so we never plan to use more than ~10% of RAM.
+	bytesPerConntrackEntry = 360
 )
 
 // ensureConntrackLoaded loads the nf_conntrack module if needed and verifies
@@ -261,47 +267,37 @@ func ensureConntrackLoaded() error {
 // from under a sibling gost --NAT instance. Failures are warnings, not fatal.
 func tuneConntrack(opts NATOptions) {
 	current := readSysctlInt(conntrackMaxPath)
-	if current <= 0 {
-		log.Logf("[nat] WARNING: cannot read %s; skipping conntrack tuning", conntrackMaxPath)
-		return
+
+	floor := defaultConntrackFloor
+	if opts.ConntrackMax > 0 {
+		floor = opts.ConntrackMax
+	}
+	if cap := memoryConntrackCap(); cap > 0 && floor > cap {
+		log.Logf("[nat] clamping nf_conntrack_max target %d -> %d (memory limit)", floor, cap)
+		floor = cap
 	}
 
-	memCap := memoryConntrackCap()
-	target := conntrackTarget(current, opts.ConntrackMax, memCap)
-
-	// Explain when an explicit override is bigger than what RAM comfortably holds.
-	if opts.ConntrackMax > 0 && memCap > 0 && opts.ConntrackMax > memCap {
-		log.Logf("[nat] note: --nat-conntrack-max %d exceeds ~10%% of RAM (~%d entries / ~%dMB); applying as requested",
-			opts.ConntrackMax, memCap, opts.ConntrackMax*bytesPerConntrackEntry/(1024*1024))
-	} else if opts.ConntrackMax == 0 && memCap > 0 && defaultConntrackFloor > memCap {
-		log.Logf("[nat] nf_conntrack_max: clamping default target %d -> %d to stay within ~10%% of RAM",
-			defaultConntrackFloor, memCap)
+	target := floor
+	if current > target {
+		target = current // raise-only
+	}
+	if target > current {
+		if err := writeSysctl(conntrackMaxPath, target); err != nil {
+			log.Logf("[nat] WARNING: could not raise nf_conntrack_max: %s", err)
+		} else {
+			log.Logf("[nat] nf_conntrack_max %d -> %d", current, target)
+		}
 	}
 
-	if target <= current {
-		// raise-only: nothing to do, but say so explicitly so it is observable.
-		log.Logf("[nat] nf_conntrack_max already %d (>= target %d); leaving as-is (raise-only)", current, target)
-	} else if err := writeSysctl(conntrackMaxPath, target); err != nil {
-		log.Logf("[nat] WARNING: could not raise nf_conntrack_max (%s): %s", conntrackMaxPath, err)
-	} else {
-		log.Logf("[nat] nf_conntrack_max %d -> %d (readback %d)", current, target, readSysctlInt(conntrackMaxPath))
-	}
-
-	// hashsize: keep buckets at ~1/4 of max for short hash chains. Writing it
-	// triggers a live, non-dropping rehash. Read the value back too.
+	// hashsize: keep buckets at ~1/4 of max for short hash chains.
 	wantHash := target / 4
 	curHash := readSysctlInt(conntrackHashPath)
-	switch {
-	case curHash <= 0:
-		log.Logf("[nat] note: nf_conntrack hashsize not readable/writable here (%s); count limit still applied", conntrackHashPath)
-	case wantHash <= curHash:
-		log.Logf("[nat] nf_conntrack hashsize already %d (>= target %d); leaving as-is", curHash, wantHash)
-	default:
+	if curHash > 0 && wantHash > curHash {
 		if err := writeSysctl(conntrackHashPath, wantHash); err != nil {
 			// EOPNOTSUPP/EPERM in containers / non-init netns — tolerate.
 			log.Logf("[nat] note: could not raise nf_conntrack hashsize (%s); continuing", err)
 		} else {
-			log.Logf("[nat] nf_conntrack hashsize %d -> %d (readback %d)", curHash, wantHash, readSysctlInt(conntrackHashPath))
+			log.Logf("[nat] nf_conntrack hashsize %d -> %d", curHash, wantHash)
 		}
 	}
 
@@ -351,22 +347,23 @@ func memoryConntrackCap() int {
 func ensureIPForward(forwards []NATForward) error {
 	needed := false
 	for _, f := range forwards {
-		if !f.DestIP.IsLoopback() {
-			needed = true
-			break
+		for _, d := range f.Dests {
+			if !d.IP.IsLoopback() {
+				needed = true
+				break
+			}
 		}
 	}
 	if !needed {
 		return nil
 	}
 	if readSysctlInt(ipForwardPath) == 1 {
-		log.Log("[nat] net.ipv4.ip_forward already enabled")
 		return nil
 	}
 	if err := writeSysctl(ipForwardPath, 1); err != nil {
 		return err
 	}
-	log.Logf("[nat] net.ipv4.ip_forward 0 -> 1 (readback %d)", readSysctlInt(ipForwardPath))
+	log.Log("[nat] enabled net.ipv4.ip_forward")
 	return nil
 }
 

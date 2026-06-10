@@ -13,16 +13,30 @@ import (
 	"github.com/go-log/log"
 )
 
-// NATForward describes a single in-kernel TCP/UDP port forward to be programmed
-// as a netfilter DNAT rule when GOST runs in --NAT mode. It is pure data and is
-// shared across platforms; the actual kernel programming lives in the
+// NATDest is one (resolved IPv4) load-balancing destination of a NATForward,
+// with its relative weight (>= 1). A forward with a single destination behaves
+// exactly as before; two or more destinations enable weighted load-balancing.
+type NATDest struct {
+	IP     net.IP
+	Port   int
+	Weight int
+}
+
+// hostport returns the "ip:port" form.
+func (d NATDest) hostport() string {
+	return net.JoinHostPort(d.IP.String(), strconv.Itoa(d.Port))
+}
+
+// NATForward describes an in-kernel TCP/UDP port forward to be programmed as a
+// netfilter DNAT rule when GOST runs in --NAT mode. With one Dest it is a plain
+// DNAT; with several it is a per-connection weighted load-balancer. It is pure
+// data and shared across platforms; the actual kernel programming lives in the
 // platform-specific nat_linux.go / nat_other.go files.
 type NATForward struct {
-	Proto    string // "tcp" or "udp"
-	BindAddr string // listen IP, empty means wildcard (all interfaces)
-	LPort    int    // local listen port
-	DestIP   net.IP // destination IP (already resolved to a literal IP)
-	DestPort int    // destination port
+	Proto    string    // "tcp" or "udp"
+	BindAddr string    // listen IP, empty means wildcard (all interfaces)
+	LPort    int       // local listen port
+	Dests    []NATDest // one or more weighted destinations
 }
 
 // NATOptions holds the global, opt-in knobs for --NAT mode.
@@ -59,20 +73,59 @@ func (f NATForward) Wildcard() bool {
 	return f.BindAddr == "" || f.BindAddr == wildcardLabel || f.BindAddr == "::"
 }
 
-// dest returns the "ip:port" destination string.
-func (f NATForward) dest() string {
-	return net.JoinHostPort(f.DestIP.String(), fmt.Sprintf("%d", f.DestPort))
+// single reports whether this forward has exactly one destination.
+func (f NATForward) single() bool { return len(f.Dests) == 1 }
+
+// totalWeight is the sum of destination weights (== nft `numgen mod N`).
+func (f NATForward) totalWeight() int {
+	n := 0
+	for _, d := range f.Dests {
+		n += d.Weight
+	}
+	return n
 }
 
-// tag is the self-describing, exact identity of this forward, embedded in every
-// rule comment and used for scoped cleanup. It is stable across restarts of the
-// same forward (no PID, no random component) so a crashed instance's rules can
-// be recognised and removed on the next startup.
-//
-//	gost-nat:<proto>:<bindaddr>:<lport>-><destip>:<dport>
-func (f NATForward) tag() string {
-	return fmt.Sprintf("%s:%s:%s:%d->%s:%d",
-		natTagPrefix, f.Proto, f.bindLabel(), f.LPort, f.DestIP.String(), f.DestPort)
+// destsLabel is a human-readable summary of the destinations, for logs.
+func (f NATForward) destsLabel() string {
+	if f.single() {
+		return f.Dests[0].hostport()
+	}
+	parts := make([]string, len(f.Dests))
+	for i, d := range f.Dests {
+		parts[i] = fmt.Sprintf("%s(w%d)", d.hostport(), d.Weight)
+	}
+	return strings.Join(parts, ",") + " [weighted RR]"
+}
+
+// identity is the stable, exact identity of this forward; it feeds instanceHash
+// (the per-instance table/chain name). It includes every destination AND weight
+// so that changing any backend or weight yields a new table (idempotent replace)
+// rather than silently reusing a stale one. For a single destination it is byte
+// -identical to the original single-dest tag, so single-dest table names — and
+// thus the proven cleanup path — are unchanged.
+func (f NATForward) identity() string {
+	if f.single() {
+		d := f.Dests[0]
+		return fmt.Sprintf("%s:%s:%s:%d->%s:%d", natTagPrefix, f.Proto, f.bindLabel(), f.LPort, d.IP.String(), d.Port)
+	}
+	parts := make([]string, len(f.Dests))
+	for i, d := range f.Dests {
+		parts[i] = fmt.Sprintf("%s:%d:%d", d.IP.String(), d.Port, d.Weight)
+	}
+	sort.Strings(parts)
+	return fmt.Sprintf("%s:%s:%s:%d->%s", natTagPrefix, f.Proto, f.bindLabel(), f.LPort, strings.Join(parts, ","))
+}
+
+// comment is the human-readable marker embedded in each rule. For a single
+// destination it is the full proven form; for multiple it is the short listen
+// identity (kept well under nft's 128-char comment limit; the backends are
+// visible in the rule itself).
+func (f NATForward) comment() string {
+	if f.single() {
+		d := f.Dests[0]
+		return fmt.Sprintf("%s:%s:%s:%d->%s:%d", natTagPrefix, f.Proto, f.bindLabel(), f.LPort, d.IP.String(), d.Port)
+	}
+	return fmt.Sprintf("%s:%s:%s:%d", natTagPrefix, f.Proto, f.bindLabel(), f.LPort)
 }
 
 // instanceHash is a short, deterministic, collision-resistant id derived from
@@ -81,48 +134,13 @@ func (f NATForward) tag() string {
 // different set yields a different hash (so concurrent gost processes never
 // collide). Used to name the per-instance nftables table / iptables chains.
 func instanceHash(forwards []NATForward) string {
-	tags := make([]string, 0, len(forwards))
+	ids := make([]string, 0, len(forwards))
 	for _, f := range forwards {
-		tags = append(tags, f.tag())
+		ids = append(ids, f.identity())
 	}
-	sort.Strings(tags)
-	sum := sha256.Sum256([]byte(strings.Join(tags, ";")))
+	sort.Strings(ids)
+	sum := sha256.Sum256([]byte(strings.Join(ids, ";")))
 	return hex.EncodeToString(sum[:])[:8]
-}
-
-const (
-	// defaultConntrackFloor is the nf_conntrack_max we raise to in NAT mode when
-	// no --nat-conntrack-max is given: ~1M entries (~360 MB at ~360 bytes/entry),
-	// suitable for hundreds of thousands of concurrent connections with headroom.
-	// It is deliberately well above Ubuntu's 262144 default. On smaller boxes it
-	// is clamped down to ~10% of RAM (see memoryConntrackCap); it is never raised
-	// below the current value (raise-only).
-	defaultConntrackFloor = 1048576
-	// bytesPerConntrackEntry is the rough kernel memory cost per conntrack entry,
-	// used to clamp the table so we never plan to use more than ~10% of RAM.
-	bytesPerConntrackEntry = 360
-)
-
-// conntrackTarget computes the raise-only nf_conntrack_max target.
-//   - current: the value currently in the kernel.
-//   - optMax:  --nat-conntrack-max (0 means "use the built-in floor").
-//   - memCap:  memory-derived ceiling, or 0 if unknown / no clamp.
-//
-// An explicit optMax is honored as-is (not memory-clamped — the operator opted
-// in). The default floor is clamped to memCap. The result is never below
-// current (raise-only, so we never shrink the table out from under live
-// traffic, including the SSH session itself).
-func conntrackTarget(current, optMax, memCap int) int {
-	desired := defaultConntrackFloor
-	if optMax > 0 {
-		desired = optMax
-	} else if memCap > 0 && desired > memCap {
-		desired = memCap
-	}
-	if desired < current {
-		desired = current
-	}
-	return desired
 }
 
 // ParseNATForward parses a single -L serve-node string into a NATForward,
@@ -148,11 +166,7 @@ func ParseNATForward(serveNode string) (NATForward, error) {
 		return NATForward{}, fmt.Errorf("-L %q has scheme %q; NAT mode supports only explicit tcp:// or udp:// forwards", serveNode, scheme)
 	}
 	if node.Remote == "" {
-		return NATForward{}, fmt.Errorf("-L %q has no destination; expected %s://[bind]:PORT/DESTIP:DESTPORT", serveNode, proto)
-	}
-	if strings.Contains(node.Remote, ",") {
-		return NATForward{}, fmt.Errorf("-L %q has multiple destinations; NAT mode supports exactly one DESTIP:PORT per -L "+
-			"(split into separate -L rules / services)", serveNode)
+		return NATForward{}, fmt.Errorf("-L %q has no destination; expected %s://[bind]:PORT/DESTIP:DESTPORT[:WEIGHT][,...]", serveNode, proto)
 	}
 
 	bindHost, bindPortStr, err := net.SplitHostPort(node.Addr)
@@ -168,20 +182,47 @@ func ParseNATForward(serveNode string) (NATForward, error) {
 		return NATForward{}, fmt.Errorf("-L %q: %v", serveNode, err)
 	}
 
-	destHost, destPortStr, err := net.SplitHostPort(node.Remote)
-	if err != nil {
-		return NATForward{}, fmt.Errorf("bad destination in -L %q: %v", serveNode, err)
-	}
-	dport, err := strconv.Atoi(destPortStr)
-	if err != nil || dport <= 0 || dport > 65535 {
-		return NATForward{}, fmt.Errorf("bad destination port in -L %q", serveNode)
-	}
-	destIP, err := resolveNATDest(destHost)
+	// One or more weighted destinations. Each is resolved to a literal IPv4.
+	parsed, err := ParseDestList(node.Remote)
 	if err != nil {
 		return NATForward{}, fmt.Errorf("-L %q: %v", serveNode, err)
 	}
+	dests := make([]NATDest, 0, len(parsed))
+	for _, p := range parsed {
+		ip, err := resolveNATDest(p.Host)
+		if err != nil {
+			return NATForward{}, fmt.Errorf("-L %q: %v", serveNode, err)
+		}
+		dests = append(dests, NATDest{IP: ip, Port: p.Port, Weight: p.Weight})
+	}
+	reduceNATWeights(dests)
 
-	return NATForward{Proto: proto, BindAddr: bindAddr, LPort: lport, DestIP: destIP, DestPort: dport}, nil
+	return NATForward{Proto: proto, BindAddr: bindAddr, LPort: lport, Dests: dests}, nil
+}
+
+// reduceNATWeights divides all weights by their GCD in place (e.g. 6:2 -> 3:1),
+// keeping the nftables `numgen mod N` modulus and the conntrack-independent
+// rotation state as small as possible. A no-op for one destination.
+func reduceNATWeights(dests []NATDest) {
+	if len(dests) < 2 {
+		return
+	}
+	g := dests[0].Weight
+	for _, d := range dests[1:] {
+		g = gcdInt(g, d.Weight)
+	}
+	if g > 1 {
+		for i := range dests {
+			dests[i].Weight /= g
+		}
+	}
+}
+
+func gcdInt(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 // normalizeNATBindAddr returns "" for a wildcard bind, or a validated literal

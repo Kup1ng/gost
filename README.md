@@ -179,9 +179,34 @@ exactly like stock gost.
 
 **Constraints**
 
-* TCP and UDP only; IPv4 only. Each `-L` must be an explicit `tcp://` or `udp://` forward to exactly **one** `DESTIP:DESTPORT` (a hostname is resolved once at startup and pinned).
+* TCP and UDP only; IPv4 only. Each `-L` is an explicit `tcp://` or `udp://` forward to one or more `DESTIP:DESTPORT` targets (a hostname is resolved once at startup and pinned).
 * `--NAT` is **incompatible with `-F`** (SOCKS5 chaining); combining them fails at startup. Chaining only works in userspace mode.
 * Requires root / `CAP_NET_ADMIN` and a working `nft` or `iptables` (see install below).
+
+**Load balancing across multiple destinations.** A `-L` may list several
+comma-separated destinations, each `IP:PORT` with an optional `:WEIGHT` suffix
+(a positive integer; default 1). New connections are distributed across the
+backends **per connection** — every packet of a connection always goes to the
+same backend it was assigned at connection start (conntrack pins the flow), so a
+connection is never split. Works for both `tcp` and `udp`, in both modes:
+
+```bash
+# equal split across three backends
+sudo gost --NAT -L=tcp://:8001/10.0.0.1:80,10.0.0.2:80,10.0.0.3:80
+# weighted 3:1 — ~3 of every 4 new connections to the first backend
+sudo gost --NAT -L=tcp://:8001/10.0.0.1:80:3,10.0.0.2:80:1
+# also works in userspace mode (omit --NAT)
+gost -L=tcp://:8001/10.0.0.1:80:3,10.0.0.2:80:1
+```
+
+Distribution differs slightly by mode:
+
+* **Userspace mode** does true **weighted round-robin** (strict rotation respecting weights).
+* **`--NAT` mode** uses the kernel: the **nftables** backend does strict weighted round-robin (`numgen inc`); the **iptables** fallback does **weighted-random** (the `statistic` module has no strict weighted mode). Both converge to the configured ratio.
+
+There is no health checking in either mode — backends are assumed up and traffic
+is distributed blindly per the weights. A malformed list (missing port, bad
+weight, etc.) is a clear startup error.
 
 **Backends.** gost prefers **nftables** (its own table `gost_nat_<id>`) and falls back to
 **iptables** (its own `GOST_*` chains). Force one with `--nat-backend=nftables|iptables` (default
@@ -191,16 +216,25 @@ catch-all rule), so SSH and other traffic are never captured, and multiple `--NA
 run on one host without colliding.
 
 **Kernel tuning (global, raise-only).** In NAT mode gost raises — and never lowers —
-`net.ipv4.ip_forward=1` (needed to forward to another host), `nf_conntrack_max` (to **1048576 / ~1M**
-by default — well above Ubuntu's 262144 — clamped down to ~10% of RAM on small boxes; override with
-`--nat-conntrack-max N`), and the conntrack hash size (`hashsize`, to ~max/4). It loads the
-`nf_conntrack` module first if needed, logs each value it sets (with a read-back), and logs when a
-value is already high enough to leave alone. These are host-wide runtime settings that persist until
-reboot and are re-applied on every gost start (gost never writes `/etc/sysctl.d`, and never lowers a
-value — that could break live connections or a sibling service). conntrack timeouts are left alone
-unless you pass `--nat-tune-timeouts`.
+`net.ipv4.ip_forward=1` (needed to forward to another host), `nf_conntrack_max` (floor 262144,
+clamped to ~10% of RAM; override with `--nat-conntrack-max N`), and the conntrack hash size. These
+are host-wide and persist until reboot (lowering them could break live connections or a sibling
+service). conntrack timeouts are left alone unless you pass `--nat-tune-timeouts`.
 
-**Install gost as a system command** (so `--nat-cleanup` and the systemd unit use the same binary):
+**Install gost as a system command** (so `--nat-cleanup` and the systemd unit use the same binary).
+
+Prebuilt Linux binaries (amd64/arm64) are published on the Releases page as
+`.tar.gz` archives with `.sha256` checksums:
+
+```bash
+curl -fL https://github.com/Kup1ng/gost/releases/latest/download/gost-linux-amd64.tar.gz -o gost.tar.gz
+tar -xzf gost.tar.gz                      # -> gost
+sudo install -m 0755 gost /usr/local/bin/gost
+gost -V
+# arm64: swap gost-linux-amd64.tar.gz -> gost-linux-arm64.tar.gz
+```
+
+Or build from source:
 
 ```bash
 cd gost/cmd/gost && go build
@@ -269,7 +303,8 @@ echo 'GOST_L=tcp://:8080/1.2.3.4:80' | sudo tee /etc/gost-nat/web.env
 sudo systemctl enable --now gost-nat@web
 ```
 
-**Limitations.** Single destination per `-L` (no kernel load-balancing); a hostname destination is
+**Limitations.** Multiple destinations are load-balanced per-connection (weighted; see above) with
+no health checking; a hostname destination is
 resolved once (restart to follow DNS changes); the destination sees the gost host's IP, not the
 original client (MASQUERADE — disable with `--nat-no-snat` only when gost is on the return path);
 on a host with a restrictive firewall in another table you may still need to allow the port there

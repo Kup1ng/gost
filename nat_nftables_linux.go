@@ -36,18 +36,13 @@ func (b *nftBackend) available() bool {
 	return exec.Command(b.bin, "list", "tables").Run() == nil
 }
 
-// tableName is the per-instance table, e.g. "gost_nat_1a2b3c4d".
-func (b *nftBackend) tableName(forwards []NATForward) string {
-	return natObjPrefix + "_" + instanceHash(forwards)
-}
-
 func (b *nftBackend) program(forwards []NATForward, opts NATOptions) error {
-	table := b.tableName(forwards)
+	table := nftTableName(forwards)
 	// Idempotent replace: drop any stale table left by a crashed run with the
 	// same -L set, then create the fresh one atomically.
 	_ = b.deleteTable(table)
 
-	doc := b.ruleset(table, forwards, opts)
+	doc := nftRuleset(table, forwards, opts)
 	if Debug {
 		log.Logf("[nat] nft ruleset:\n%s", doc)
 	}
@@ -60,7 +55,7 @@ func (b *nftBackend) program(forwards []NATForward, opts NATOptions) error {
 }
 
 func (b *nftBackend) cleanup(forwards []NATForward, _ NATOptions) error {
-	return b.deleteTable(b.tableName(forwards))
+	return b.deleteTable(nftTableName(forwards))
 }
 
 // rescue deletes every ip table whose name carries the gost prefix.
@@ -98,54 +93,4 @@ func (b *nftBackend) deleteTable(name string) error {
 		return nil
 	}
 	return fmt.Errorf("nft delete table ip %s: %v: %s", name, err, strings.TrimSpace(s))
-}
-
-// ruleset renders the full nft document for `nft -f -`.
-func (b *nftBackend) ruleset(table string, forwards []NATForward, opts NATOptions) string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "table ip %s {\n", table)
-
-	// prerouting DNAT
-	sb.WriteString("\tchain pre {\n")
-	sb.WriteString("\t\ttype nat hook prerouting priority -100; policy accept;\n")
-	for _, f := range forwards {
-		sb.WriteString("\t\t")
-		if !f.Wildcard() {
-			fmt.Fprintf(&sb, "ip daddr %s ", f.BindAddr)
-		}
-		fmt.Fprintf(&sb, "%s dport %d dnat to %s comment \"%s\"\n", f.Proto, f.LPort, f.dest(), f.tag())
-	}
-	sb.WriteString("\t}\n")
-
-	// postrouting MASQUERADE, scoped to the DNAT'd flow only.
-	sb.WriteString("\tchain post {\n")
-	sb.WriteString("\t\ttype nat hook postrouting priority 100; policy accept;\n")
-	if !opts.NoSNAT {
-		for _, f := range forwards {
-			fmt.Fprintf(&sb, "\t\tip daddr %s %s dport %d ct status dnat masquerade comment \"%s\"\n",
-				f.DestIP.String(), f.Proto, f.DestPort, f.tag())
-		}
-	}
-	sb.WriteString("\t}\n")
-
-	// forward ACCEPT, scoped to the DNAT'd flow (+ established/related replies).
-	// NOTE: the chain is named "forward" (not "fwd") because `fwd` is a reserved
-	// nftables keyword (the fwd verdict statement) and is rejected as a chain
-	// name; "forward" is a valid identifier (it is the chain name in Ubuntu's
-	// default /etc/nftables.conf).
-	if !opts.NoForwardRule {
-		sb.WriteString("\tchain forward {\n")
-		sb.WriteString("\t\ttype filter hook forward priority 0; policy accept;\n")
-		for _, f := range forwards {
-			// accept both directions of this DNAT'd flow only.
-			fmt.Fprintf(&sb, "\t\tip daddr %s %s dport %d ct status dnat accept comment \"%s\"\n",
-				f.DestIP.String(), f.Proto, f.DestPort, f.tag())
-			fmt.Fprintf(&sb, "\t\tip saddr %s %s sport %d ct status dnat accept comment \"%s\"\n",
-				f.DestIP.String(), f.Proto, f.DestPort, f.tag())
-		}
-		sb.WriteString("\t}\n")
-	}
-
-	sb.WriteString("}\n")
-	return sb.String()
 }

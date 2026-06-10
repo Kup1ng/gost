@@ -573,6 +573,21 @@ func (r *route) GenRouters() ([]router, error) {
 			return nil, err
 		}
 
+		// Expand weighted multi-destination lists (IP:PORT[:WEIGHT],...) for the
+		// port-forward handlers, so the handler's round-robin selector yields
+		// per-connection weighted round-robin. A single unweighted destination
+		// round-trips unchanged (no behavior change for existing configs).
+		remote := node.Remote
+		switch node.Protocol {
+		case "tcp", "udp", "rtcp", "rudp", "":
+			if remote != "" {
+				remote, err = gost.ExpandWeightedDests(remote)
+				if err != nil {
+					return nil, fmt.Errorf("-L %q: %v", ns, err)
+				}
+			}
+		}
+
 		var handler gost.Handler
 		switch node.Protocol {
 		case "http2":
@@ -586,13 +601,13 @@ func (r *route) GenRouters() ([]router, error) {
 		case "http":
 			handler = gost.HTTPHandler()
 		case "tcp":
-			handler = gost.TCPDirectForwardHandler(node.Remote)
+			handler = gost.TCPDirectForwardHandler(remote)
 		case "rtcp":
-			handler = gost.TCPRemoteForwardHandler(node.Remote)
+			handler = gost.TCPRemoteForwardHandler(remote)
 		case "udp":
-			handler = gost.UDPDirectForwardHandler(node.Remote)
+			handler = gost.UDPDirectForwardHandler(remote)
 		case "rudp":
-			handler = gost.UDPRemoteForwardHandler(node.Remote)
+			handler = gost.UDPRemoteForwardHandler(remote)
 		case "forward":
 			handler = gost.SSHForwardHandler()
 		case "red", "redirect":
@@ -614,7 +629,7 @@ func (r *route) GenRouters() ([]router, error) {
 		default:
 			// start from 2.5, if remote is not empty, then we assume that it is a forward tunnel.
 			if node.Remote != "" {
-				handler = gost.TCPDirectForwardHandler(node.Remote)
+				handler = gost.TCPDirectForwardHandler(remote)
 			} else {
 				handler = gost.AutoHandler()
 			}
