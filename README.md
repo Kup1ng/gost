@@ -223,15 +223,15 @@ service). conntrack timeouts are left alone unless you pass `--nat-tune-timeouts
 
 **Install gost as a system command** (so `--nat-cleanup` and the systemd unit use the same binary).
 
-Prebuilt Linux binaries (amd64/arm64) are published on the Releases page as
-`.tar.gz` archives with `.sha256` checksums:
+Prebuilt Linux binaries (amd64/arm64) are published on the Releases page as raw
+binaries with `.sha256` checksums:
 
 ```bash
-curl -fL https://github.com/Kup1ng/gost/releases/latest/download/gost-linux-amd64.tar.gz -o gost.tar.gz
-tar -xzf gost.tar.gz                      # -> gost
+curl -fL https://github.com/Kup1ng/gost/releases/latest/download/gost-linux-amd64 -o gost
+chmod +x gost
 sudo install -m 0755 gost /usr/local/bin/gost
 gost -V
-# arm64: swap gost-linux-amd64.tar.gz -> gost-linux-arm64.tar.gz
+# arm64: swap gost-linux-amd64 -> gost-linux-arm64
 ```
 
 Or build from source:

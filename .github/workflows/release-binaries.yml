@@ -1,11 +1,10 @@
 name: release-binaries
 
 # Cross-compiles the --NAT-enabled gost into real static Linux binaries on
-# GitHub's runners and publishes them as GitHub Release assets, packaged as
-# gost-linux-amd64.tar.gz / gost-linux-arm64.tar.gz (each with a .sha256).
-# Binaries are NOT stripped (keeping the symbol table reduces antivirus
-# false-positives on Go binaries) and the .tar.gz wrapper avoids AV/browser
-# flagging of a raw ELF download.
+# GitHub's runners and publishes them as GitHub Release assets: the raw
+# uncompressed binaries gost-linux-amd64 / gost-linux-arm64 (curl-able directly),
+# each with a .sha256. Binaries are NOT stripped (no -s -w): keeping the symbol
+# table reduces antivirus false-positives on Go binaries.
 #
 # Trigger: push a tag matching v*  (e.g. `git tag v2.14 && git push origin v2.14`).
 # A manual workflow_dispatch run builds the artifacts but does NOT publish a
@@ -39,7 +38,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-      - name: Build & package (CGO disabled, NOT stripped)
+      - name: Build raw binary (CGO disabled, NOT stripped)
         env:
           CGO_ENABLED: '0'
           GOOS: ${{ matrix.goos }}
@@ -47,17 +46,17 @@ jobs:
         run: |
           # No -s -w: keeping the symbol table reduces antivirus false-positives
           # on the Go binary. -trimpath keeps the build reproducible.
-          go build -trimpath -o gost ./cmd/gost
-          tar -czf "gost-${GOOS}-${GOARCH}.tar.gz" gost
-          sha256sum "gost-${GOOS}-${GOARCH}.tar.gz" > "gost-${GOOS}-${GOARCH}.tar.gz.sha256"
-          ls -l gost "gost-${GOOS}-${GOARCH}.tar.gz"
-          file gost || true
+          out="gost-${GOOS}-${GOARCH}"
+          go build -trimpath -o "$out" ./cmd/gost
+          sha256sum "$out" > "$out.sha256"
+          ls -l "$out"
+          file "$out" || true
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.goarch }}
           path: |
-            gost-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
-            gost-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz.sha256
+            gost-${{ matrix.goos }}-${{ matrix.goarch }}
+            gost-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
           if-no-files-found: error
 
   release:
